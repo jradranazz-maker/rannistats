@@ -1784,6 +1784,13 @@ function render(){
   window.scrollTo({ top: 0, behavior: "instant" in window ? "instant" : "auto" });
 
   if (homeHeroTimer) { clearInterval(homeHeroTimer); homeHeroTimer = null; }
+  /* Drop every live-news repaint listener before the new page mounts. They
+   * belong to DOM that was just thrown away, and one page can have several
+   * consumers (the home hero AND its headlines card), so each has to
+   * re-register itself rather than any one of them clearing the list — which
+   * is what left the hero stuck on "Loading" when the headlines card reset
+   * the list out from under it. */
+  Object.keys(liveNewsListeners).forEach(function(id){ liveNewsListeners[id] = []; });
   newsHeroEl.innerHTML = "";
   if (r.name === "home") {
     newsHeroEl.appendChild(r.sport ? buildNewsHero(r.sport) : buildNewsHeroGlobal());
@@ -2780,32 +2787,26 @@ function renderGlobalHome(root){
   var newsCard = el("div", "card");
   var nh = el("div", "card-head");
   nh.appendChild(txt("h3", null, "Latest Across the League"));
+  var newsHint = txt("span", "hint", "");
+  nh.appendChild(newsHint);
   newsCard.appendChild(nh);
-  var newsList = el("div", "news-list");
-  var allStories = [];
-  SPORT_ORDER.forEach(function(id){
-    (SPORT_INDEX[id].data.newsFeed||[]).forEach(function(n){ allStories.push({ sportId: id, n: n }); });
-  });
-  allStories.sort(function(a,b){ return a.n.hoursAgo - b.n.hoursAgo; });
-  allStories.slice(0,6).forEach(function(s){
-    var idx = SPORT_INDEX[s.sportId], n = s.n;
-    var p = n.playerId ? idx.playerById[n.playerId] : null;
-    var nt = idx.teamByAbbr[n.team];
-    var item = el("div", "news-item");
-    var catWrap = el("div", "news-cat");
-    var catCls = n.category === "Injury" ? "cat-injury" : n.category === "Performance" ? "cat-performance" : "";
-    catWrap.innerHTML = '<span class="' + catCls + '"></span>';
-    catWrap.querySelector("span").textContent = idx.label + " · " + n.category;
-    item.appendChild(catWrap);
-    var nbody = el("div", "news-body");
-    nbody.appendChild(txt("h4", null, n.headline));
-    nbody.appendChild(txt("p", null, n.body));
-    item.appendChild(nbody);
-    item.appendChild(txt("div", "news-meta", (n.hoursAgo < 24 ? n.hoursAgo + "h ago" : Math.round(n.hoursAgo/24) + "d ago") + " · " + nt.abbr));
-    item.addEventListener("click", function(){ navigateTo(s.sportId, p ? "player" : "news", p ? p.id : null); });
-    newsList.appendChild(item);
-  });
-  newsCard.appendChild(newsList);
+  var newsWrap = el("div");
+  newsCard.appendChild(newsWrap);
+  var newsIds = liveNewsSportIds();
+  function paintHomeNews(){
+    var state = newsLoadState(newsIds);
+    newsHint.textContent = state.count ? "top " + Math.min(state.count, 6) : "";
+    newsWrap.innerHTML = "";
+    if (state.loading) { newsWrap.appendChild(txt("div", "empty-note", "Loading the latest from ESPN…")); return; }
+    if (!state.count) { newsWrap.appendChild(txt("div", "empty-note", newsEmptyNote(state))); return; }
+    var list = el("div", "news-list");
+    collectStories(newsIds).slice(0, 6).forEach(function(s){
+      list.appendChild(buildCrossSportNewsItem(s.sportId, s.n));
+    });
+    newsWrap.appendChild(list);
+  }
+  newsIds.forEach(function(id){ ensureLiveNews(id, paintHomeNews); });
+  paintHomeNews();
   root.appendChild(newsCard);
 }
 function sportBlurb(id){
@@ -2835,22 +2836,83 @@ function sportHeadlineStat(id){
 /* ============================= CROSS-SPORT NEWS ITEM (shared) ============================= */
 // Builds one row for a news feed list, tagged with its sport label since these
 // lists mix stories from multiple sports (My Feed, global News/Home).
+/* ---- shared news plumbing ----------------------------------------------
+ * data.json's bundled `newsFeed` is empty, and has been since the site moved
+ * to fetching news live from ESPN -- nothing regenerates the baked copy. Any
+ * surface still reading it therefore rendered a card with no stories and no
+ * explanation. The phone's News tab was the worst of them: a heading, the
+ * words "0 stories", and then blank space to the footer.
+ *
+ * These helpers give every news surface the same source of truth the per-sport
+ * News page already used, plus its loading / unreachable / empty states, so a
+ * feed that hasn't landed says so instead of looking broken. */
+function liveNewsSportIds(){
+  return SPORT_ORDER.filter(function(id){ return !!ESPN_NEWS_URL[id]; });
+}
+// Live stories when they've arrived, the bundled ones otherwise. Live items
+// carry ESPN's own top-headlines rank; bundled ones only have an age.
+function newsStoriesFor(sportId){
+  var cache = liveNewsCache[sportId];
+  if (cache && cache.items && cache.items.length) {
+    return cache.items.slice().sort(function(a, b){ return a.trendRank - b.trendRank; });
+  }
+  var D = SPORT_INDEX[sportId].data;
+  return (D.newsFeed || []).slice().sort(function(a, b){ return a.hoursAgo - b.hoursAgo; });
+}
+function newsLoadState(ids){
+  var loading = false, error = false, count = 0;
+  ids.forEach(function(id){
+    var c = liveNewsCache[id];
+    if (c && c.status === "loading") loading = true;
+    if (c && c.status === "error") error = true;
+    count += newsStoriesFor(id).length;
+  });
+  // Only report loading/error while there is genuinely nothing to show.
+  return { loading: loading && !count, error: error && !count, count: count };
+}
+function newsEmptyNote(state){
+  return state.error
+    ? "Couldn't reach ESPN's news feed just now — it'll fill in on your next visit, or tap refresh on the NFL news page."
+    : "No stories available right now.";
+}
+function sortStoriesForDisplay(stories){
+  return stories.sort(function(a, b){
+    var ra = a.n.trendRank, rb = b.n.trendRank;
+    if (ra != null && rb != null) return ra - rb;
+    return (a.n.hoursAgo || 0) - (b.n.hoursAgo || 0);
+  });
+}
+function collectStories(ids){
+  var out = [];
+  ids.forEach(function(id){
+    newsStoriesFor(id).forEach(function(n){ out.push({ sportId: id, n: n }); });
+  });
+  return sortStoriesForDisplay(out);
+}
+
 function buildCrossSportNewsItem(sportId, n){
   var idx = SPORT_INDEX[sportId];
   var p = n.playerId ? idx.playerById[n.playerId] : null;
-  var t = idx.teamByAbbr[n.team];
-  var item = el("div", "news-item");
+  // Live ESPN stories are often league-wide with no team attached, which the
+  // old unconditional n.team lookup turned into a crash.
+  var t = n.team ? idx.teamByAbbr[n.team] : null;
+  var item = el("div", "news-item" + (n.url ? " is-external" : ""));
   var catWrap = el("div", "news-cat");
   var catCls = n.category === "Injury" ? "cat-injury" : n.category === "Performance" ? "cat-performance" : "";
   catWrap.innerHTML = '<span class="' + catCls + '"></span>';
-  catWrap.querySelector("span").textContent = idx.label + " · " + n.category;
+  catWrap.querySelector("span").textContent = idx.label + (n.category ? " · " + n.category : "");
   item.appendChild(catWrap);
   var body = el("div", "news-body");
   body.appendChild(txt("h4", null, n.headline));
   body.appendChild(txt("p", null, n.body));
   item.appendChild(body);
-  item.appendChild(txt("div", "news-meta", (n.hoursAgo < 24 ? n.hoursAgo + "h ago" : Math.round(n.hoursAgo/24) + "d ago") + " · " + t.abbr));
-  item.addEventListener("click", function(){ navigateTo(sportId, p ? "player" : "news", p ? p.id : null); });
+  var age = n.hoursAgo == null ? ""
+    : n.hoursAgo < 1 ? "just now"
+    : n.hoursAgo < 24 ? Math.round(n.hoursAgo) + "h ago"
+    : Math.round(n.hoursAgo / 24) + "d ago";
+  item.appendChild(txt("div", "news-meta", age + (t ? (age ? " · " : "") + t.abbr : "")));
+  if (n.url) item.addEventListener("click", function(){ window.open(n.url, "_blank", "noopener"); });
+  else item.addEventListener("click", function(){ navigateTo(sportId, p ? "player" : "news", p ? p.id : null); });
   return item;
 }
 
@@ -2918,28 +2980,39 @@ function renderMyFeed(root){
     root.appendChild(grid);
   }
 
-  // News & injuries for favorited teams, newest first.
-  var stories = [];
-  favs.forEach(function(f){
-    var D = f.idx.data;
-    (D.newsFeed || []).forEach(function(n){
-      if (n.team === f.team.abbr) stories.push({ sportId: f.sportId, n: n });
-    });
-  });
-  stories.sort(function(a,b){ return a.n.hoursAgo - b.n.hoursAgo; });
-
+  // News for the favorited teams, drawn from the same live ESPN feed as the
+  // News page. A league-wide story with no team attached isn't "your team's
+  // news", so those are left out here on purpose.
   var newsCard = el("div", "card");
   var nh = el("div", "card-head");
   nh.appendChild(txt("h3", null, "Your Teams' News"));
-  nh.appendChild(txt("span", "hint", stories.length + " stories"));
+  var feedHint = txt("span", "hint", "");
+  nh.appendChild(feedHint);
   newsCard.appendChild(nh);
-  if (stories.length) {
-    var newsList = el("div", "news-list");
-    stories.forEach(function(s){ newsList.appendChild(buildCrossSportNewsItem(s.sportId, s.n)); });
-    newsCard.appendChild(newsList);
-  } else {
-    newsCard.appendChild(txt("div", "empty-note", "No recent news for your favorite teams — check back later."));
+  var feedWrap = el("div");
+  newsCard.appendChild(feedWrap);
+  var feedIds = [];
+  favs.forEach(function(f){ if (ESPN_NEWS_URL[f.sportId] && feedIds.indexOf(f.sportId) === -1) feedIds.push(f.sportId); });
+  function paintFeedNews(){
+    var mine = collectStories(feedIds).filter(function(s){
+      return favs.some(function(f){ return f.sportId === s.sportId && s.n.team === f.team.abbr; });
+    });
+    var state = newsLoadState(feedIds);
+    feedHint.textContent = mine.length + " stor" + (mine.length === 1 ? "y" : "ies");
+    feedWrap.innerHTML = "";
+    if (state.loading) { feedWrap.appendChild(txt("div", "empty-note", "Loading the latest from ESPN…")); return; }
+    if (!mine.length) {
+      feedWrap.appendChild(txt("div", "empty-note", state.error
+        ? newsEmptyNote(state)
+        : "No recent news for your favorite teams — check back later."));
+      return;
+    }
+    var list = el("div", "news-list");
+    mine.forEach(function(s){ list.appendChild(buildCrossSportNewsItem(s.sportId, s.n)); });
+    feedWrap.appendChild(list);
   }
+  feedIds.forEach(function(id){ ensureLiveNews(id, paintFeedNews); });
+  paintFeedNews();
   root.appendChild(newsCard);
 }
 
@@ -2982,21 +3055,40 @@ function renderGlobalScores(root){
 /* ============================= GLOBAL NEWS ============================= */
 function renderGlobalNews(root){
   root.appendChild(sectionHead("News", DATA_ALL.meta.seasonLabel));
-  var stories = [];
-  SPORT_ORDER.forEach(function(sportId){
-    (SPORT_INDEX[sportId].data.newsFeed || []).forEach(function(n){ stories.push({ sportId: sportId, n: n }); });
-  });
-  stories.sort(function(a,b){ return a.n.hoursAgo - b.n.hoursAgo; });
+  var ids = liveNewsSportIds();
 
   var newsCard = el("div", "card");
   var nh = el("div", "card-head");
   nh.appendChild(txt("h3", null, "Latest Across the League"));
-  nh.appendChild(txt("span", "hint", stories.length + " stories"));
+  var hint = txt("span", "hint", "");
+  nh.appendChild(hint);
   newsCard.appendChild(nh);
-  var newsList = el("div", "news-list");
-  stories.slice(0, 24).forEach(function(s){ newsList.appendChild(buildCrossSportNewsItem(s.sportId, s.n)); });
-  newsCard.appendChild(newsList);
+  var listWrap = el("div");
+  newsCard.appendChild(listWrap);
   root.appendChild(newsCard);
+
+  function paint(){
+    var state = newsLoadState(ids);
+    hint.textContent = state.count ? (state.count + " stor" + (state.count === 1 ? "y" : "ies")) : "";
+    listWrap.innerHTML = "";
+    if (state.loading) {
+      listWrap.appendChild(txt("div", "empty-note", "Loading the latest from ESPN…"));
+      return;
+    }
+    if (!state.count) {
+      listWrap.appendChild(txt("div", "empty-note", newsEmptyNote(state)));
+      return;
+    }
+    var list = el("div", "news-list");
+    collectStories(ids).slice(0, 24).forEach(function(s){
+      list.appendChild(buildCrossSportNewsItem(s.sportId, s.n));
+    });
+    listWrap.appendChild(list);
+  }
+  // Only one page is mounted at a time (every route change clears #app), so
+  // drop listeners left by the previous one rather than letting them pile up.
+  ids.forEach(function(id){ ensureLiveNews(id, paint); });
+  paint();
 }
 
 /* ============================= PER-SPORT HOME ============================= */
@@ -3125,27 +3217,26 @@ function renderHome(root, sportId){
   var newsCard = el("div", "card");
   var nh = el("div", "card-head");
   nh.appendChild(txt("h3", null, "Latest Headlines"));
+  var headHint = txt("span", "hint", "");
+  nh.appendChild(headHint);
   newsCard.appendChild(nh);
-  var newsList = el("div", "news-list");
-  var top3 = [...(D.newsFeed||[])].sort(function(a,b){ return a.hoursAgo - b.hoursAgo; }).slice(0, 3);
-  top3.forEach(function(n){
-    var p = n.playerId ? idx.playerById[n.playerId] : null;
-    var nt = idx.teamByAbbr[n.team];
-    var item = el("div", "news-item");
-    var catWrap = el("div", "news-cat");
-    var catCls = n.category === "Injury" ? "cat-injury" : n.category === "Performance" ? "cat-performance" : "";
-    catWrap.innerHTML = '<span class="' + catCls + '"></span>';
-    catWrap.querySelector("span").textContent = n.category;
-    item.appendChild(catWrap);
-    var nbody = el("div", "news-body");
-    nbody.appendChild(txt("h4", null, n.headline));
-    nbody.appendChild(txt("p", null, n.body));
-    item.appendChild(nbody);
-    item.appendChild(txt("div", "news-meta", (n.hoursAgo < 24 ? n.hoursAgo + "h ago" : Math.round(n.hoursAgo/24) + "d ago") + " · " + nt.abbr));
-    if (p) item.addEventListener("click", function(){ navigate("player", p.id); });
-    newsList.appendChild(item);
-  });
-  newsCard.appendChild(newsList);
+  var headWrap = el("div");
+  newsCard.appendChild(headWrap);
+  var headIds = ESPN_NEWS_URL[sportId] ? [sportId] : [];
+  function paintHeadlines(){
+    var state = newsLoadState(headIds);
+    headHint.textContent = state.count ? "top 3" : "";
+    headWrap.innerHTML = "";
+    if (state.loading) { headWrap.appendChild(txt("div", "empty-note", "Loading the latest from ESPN…")); return; }
+    if (!state.count) { headWrap.appendChild(txt("div", "empty-note", newsEmptyNote(state))); return; }
+    var list = el("div", "news-list");
+    collectStories(headIds).slice(0, 3).forEach(function(s){
+      list.appendChild(buildCrossSportNewsItem(s.sportId, s.n));
+    });
+    headWrap.appendChild(list);
+  }
+  headIds.forEach(function(id){ ensureLiveNews(id, paintHeadlines); });
+  paintHeadlines();
   var foot = el("div", "card-foot");
   var seeAll = txt("button", "back-link", "See all news →");
   seeAll.addEventListener("click", function(){ navigate("news"); });
@@ -5019,10 +5110,8 @@ function renderNews(root, sportId){
     });
     newsListWrap.appendChild(newsList);
   }
-  // Only one News page is ever mounted at a time in this app (every route
-  // change clears #app), so drop any listener left over from a previous
-  // visit before registering this one — otherwise it piles up forever.
-  liveNewsListeners[sportId] = [];
+  // render() clears every live-news listener before a page mounts, so this
+  // just registers this page's own repaint.
   ensureLiveNews(sportId, paintNewsFeed);
   paintNewsFeed();
 }

@@ -1,0 +1,25 @@
+name = "rannistats-push"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+# Every minute. The handler returns immediately when nobody is subscribed, and
+# only fetches ESPN's news feed when someone actually wants injury alerts, so a
+# quiet week costs one small request per minute — comfortably inside the free
+# tier's 100k requests/day.
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+# Only these origins may call the API from a browser. Add a localhost entry
+# while testing a local build of the site.
+ALLOWED_ORIGINS = "https://jradranazz-maker.github.io,http://localhost:8080,http://127.0.0.1:8080"
+# Push services want a contact address for whoever operates this server, so
+# they can get in touch if it misbehaves. Put your real email here.
+VAPID_SUBJECT = "mailto:radazzisijared@gmail.com"
+
+# Holds the device subscriptions, the VAPID keypair, and the previous poll's
+# scoreboard. Already created in this account on 2026-09-19 as "PUSH_KV";
+# the id below is that namespace, so there is nothing to create by hand.
+[[kv_namespaces]]
+binding = "PUSH_KV"
+id = "0bc80b854db149fa9e6c7be02d580e88"

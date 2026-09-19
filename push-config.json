@@ -1,4 +1,4 @@
 {
-  "_comment": "Address of the RanniStats push Worker. After `wrangler deploy` prints your Worker URL, paste it here as \"api\" and commit this file. The app reads it at runtime, so changing it does not need an index.html rebuild. Leave it as-is and notifications simply stay off.",
-  "api": "PASTE_YOUR_WORKER_URL_HERE"
+  "_comment": "Where the notification server lives. Read at runtime, so the address can change with a 300-byte upload instead of rebuilding index.html. Deployed 2026-09-19; verified answering /key with a 65-byte P-256 VAPID key.",
+  "api": "https://rannistats-push.jradranazz.workers.dev"
 }
